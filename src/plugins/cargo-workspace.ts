@@ -26,6 +26,8 @@ import {
   CargoDependencies,
   CargoDependency,
   TargetDependencies,
+  hasVersionedWorkspacePathDeps,
+  isInheritedVersion,
 } from '../updaters/rust/common';
 import {VersionsMap, Version} from '../version';
 import {CargoToml} from '../updaters/rust/cargo-toml';
@@ -72,6 +74,14 @@ interface CrateInfo {
    * Parsed cargo manifest
    */
   manifest: CargoManifest;
+
+  /**
+   * Whether the crate's version is inherited from the workspace root
+   * (`version.workspace = true`). Such crates are versioned by
+   * `[workspace.package].version` in the root manifest, which the root
+   * candidate updates; their own manifests must not be rewritten.
+   */
+  inheritsVersion: boolean;
 }
 
 /**
@@ -84,6 +94,29 @@ interface CrateInfo {
 export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
   private strategiesByPath: Record<string, Strategy> = {};
   private releasesByPath: Record<string, Release> = {};
+
+  /**
+   * The workspace root's `[workspace.package].version`, used to resolve
+   * versions for members declaring `version.workspace = true`.
+   */
+  private workspaceRootVersion?: string;
+
+  /**
+   * Whether any workspace member inherits its version from the root.
+   */
+  private hasInheritedVersion = false;
+
+  /**
+   * The new version the workspace shared version will be bumped to, set
+   * while processing an inherited-version member.
+   */
+  private workspaceNewRootVersion?: Version;
+
+  /**
+   * Names of the crates that are members of this workspace (used to identify
+   * path-dependencies on sibling crates).
+   */
+  private workspaceCrateNames: Set<string> = new Set();
 
   protected async buildAllPackages(
     candidates: CandidateReleasePullRequest[]
@@ -105,6 +138,10 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
       return {allPackages: [], candidatesByPackage: {}};
     }
 
+    // Single source of truth for workspaces that use shared versions:
+    // members declaring `version.workspace = true` resolve against this.
+    this.workspaceRootVersion = cargoManifest.workspace.package?.version;
+
     const allCrates: CrateInfo[] = [];
     const candidatesByPackage: Record<string, CandidateReleasePullRequest> = {};
 
@@ -116,6 +153,8 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
       )
     ).flat();
     members.push(ROOT_PROJECT_PATH);
+
+    const workspaceCrateNames = new Set<string>();
 
     for (const path of members) {
       const manifestPath = addPath(path, 'Cargo.toml');
@@ -142,8 +181,25 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
         candidatesByPackage[packageName] = candidate;
       }
 
-      const version = manifest.package?.version;
-      if (!version) {
+      let version = manifest.package?.version;
+      let inheritsVersion = false;
+      if (isInheritedVersion(version)) {
+        // `version.workspace = true`: resolve the version from the root
+        // `[workspace.package].version`.
+        inheritsVersion = true;
+        this.hasInheritedVersion = true;
+        const rootVersion = this.workspaceRootVersion;
+        if (rootVersion === undefined) {
+          throw new ConfigurationError(
+            `package manifest at ${manifestPath} inherits its version from the ` +
+              'workspace root, but the root Cargo.toml has no ' +
+              '[workspace.package].version',
+            'cargo-workspace',
+            `${this.github.repository.owner}/${this.github.repository.repo}`
+          );
+        }
+        version = rootVersion;
+      } else if (version === undefined) {
         throw new ConfigurationError(
           `package manifest at ${manifestPath} is missing [package.version]`,
           'cargo-workspace',
@@ -156,15 +212,20 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
           `${this.github.repository.owner}/${this.github.repository.repo}`
         );
       }
+      if (path !== ROOT_PROJECT_PATH) {
+        workspaceCrateNames.add(packageName);
+      }
       allCrates.push({
         path,
         name: packageName,
         version,
+        inheritsVersion,
         manifest,
         manifestContent: manifestContent.parsedContent,
         manifestPath,
       });
     }
+    this.workspaceCrateNames = workspaceCrateNames;
     return {
       allPackages: allCrates,
       candidatesByPackage,
@@ -176,6 +237,20 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
     return new PatchVersionUpdate().bump(version);
   }
 
+  /**
+   * Returns whether the member manifest needs to be rewritten in place.
+   * Inherited-version members are versioned by the root manifest, so they only
+   * need updating when they carry versioned path-dependencies on sibling
+   * crates that must be kept in sync.
+   * @param pkg the crate
+   */
+  private manifestNeedsUpdate(pkg: CrateInfo): boolean {
+    return (
+      !pkg.inheritsVersion ||
+      hasVersionedWorkspacePathDeps(pkg.manifest, this.workspaceCrateNames)
+    );
+  }
+
   protected updateCandidate(
     existingCandidate: CandidateReleasePullRequest,
     pkg: CrateInfo,
@@ -184,6 +259,17 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
     const version = updatedVersions.get(pkg.name);
     if (!version) {
       throw new Error(`Didn't find updated version for ${pkg.name}`);
+    }
+    if (pkg.inheritsVersion) {
+      // The member's version is the workspace shared version: remember the
+      // new version so the root [workspace.package].version can be bumped.
+      this.workspaceNewRootVersion = version;
+    }
+    if (!this.manifestNeedsUpdate(pkg)) {
+      this.logger.info(
+        `skipping ${pkg.manifestPath} (version inherited from workspace root)`
+      );
+      return existingCandidate;
     }
     const updater = new CargoToml({
       version,
@@ -246,6 +332,31 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
     const version = updatedVersions.get(pkg.name);
     if (!version) {
       throw new Error(`Didn't find updated version for ${pkg.name}`);
+    }
+    if (pkg.inheritsVersion) {
+      // The member's version is the workspace shared version: remember the
+      // new version so the root [workspace.package].version can be bumped.
+      this.workspaceNewRootVersion = version;
+    }
+    if (!this.manifestNeedsUpdate(pkg)) {
+      this.logger.info(
+        `skipping ${pkg.manifestPath} (version inherited from workspace root)`
+      );
+      return {
+        path: pkg.path,
+        pullRequest: {
+          title: PullRequestTitle.ofTargetBranch(this.targetBranch),
+          body: new PullRequestBody([]),
+          updates: [],
+          labels: [],
+          headRefName: BranchName.ofTargetBranch(this.targetBranch).toString(),
+          version,
+          draft: false,
+        },
+        config: {
+          releaseType: 'rust',
+        },
+      };
     }
     const updater = new CargoToml({
       version,
@@ -348,6 +459,24 @@ export class CargoWorkspace extends WorkspacePlugin<CrateInfo> {
       createIfMissing: false,
       updater: new CargoLock(updatedVersions),
     });
+
+    // Workspaces that use shared versions bump [workspace.package].version
+    // in the root manifest; the individual member manifests are left alone.
+    const newRootVersion = this.workspaceNewRootVersion;
+    if (
+      this.hasInheritedVersion &&
+      this.workspaceRootVersion !== undefined &&
+      newRootVersion
+    ) {
+      rootCandidate.pullRequest.updates.push({
+        path: 'Cargo.toml',
+        createIfMissing: false,
+        updater: new CargoToml({
+          version: newRootVersion,
+          versionsMap: updatedVersions,
+        }),
+      });
+    }
 
     return candidates;
   }

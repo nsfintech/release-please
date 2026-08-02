@@ -40,11 +40,81 @@ export interface TargetDependencies {
 
 export interface CargoWorkspace {
   members?: string[];
+  /**
+   * Inherited defaults for workspace members, e.g.
+   * `[workspace.package] version = "0.1.0"`.
+   */
+  package?: CargoWorkspacePackage;
+}
+
+export interface CargoWorkspacePackage {
+  name?: string;
+  version?: string;
 }
 
 export interface CargoPackage {
   name?: string;
-  version?: string;
+  version?: string | CargoInheritedVersion;
+}
+
+/**
+ * A `version = { workspace = true }` inheritance marker, resolved against
+ * `[workspace.package]` in the workspace root `Cargo.toml`.
+ */
+export interface CargoInheritedVersion {
+  workspace?: boolean;
+}
+
+/**
+ * Returns whether the package version is inherited from the workspace
+ * root via `version.workspace = true`.
+ * @param version the parsed `[package].version` value
+ */
+export function isInheritedVersion(
+  version: string | CargoInheritedVersion | undefined
+): version is CargoInheritedVersion {
+  return (
+    typeof version === 'object' &&
+    version !== null &&
+    version.workspace === true
+  );
+}
+
+/**
+ * Returns whether the manifest declares any dependency on another crate in
+ * the workspace with an explicit `{ path = ..., version = ... }`. Such
+ * dependencies still need to be bumped in the member manifest when the
+ * workspace version changes, even if the member's own version is inherited
+ * from the workspace root.
+ * @param manifest the parsed manifest
+ * @param workspaceCrateNames names of the other crates in the workspace
+ */
+export function hasVersionedWorkspacePathDeps(
+  manifest: CargoManifest,
+  workspaceCrateNames: Set<string>
+): boolean {
+  const deps: CargoDependencies = {};
+  for (const depKind of DEP_KINDS) {
+    Object.assign(deps, manifest[depKind]);
+  }
+  if (manifest.target) {
+    for (const targetName in manifest.target) {
+      for (const depKind of DEP_KINDS) {
+        Object.assign(deps, manifest.target[targetName][depKind]);
+      }
+    }
+  }
+  return Object.entries(deps).some(([name, dep]) => {
+    if (!workspaceCrateNames.has(name)) {
+      return false;
+    }
+    return (
+      typeof dep === 'object' &&
+      dep !== null &&
+      typeof dep.path === 'string' &&
+      typeof dep.version === 'string'
+    );
+  });
 }
 
 export interface CargoDependencies {
