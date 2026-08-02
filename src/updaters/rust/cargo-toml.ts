@@ -13,12 +13,19 @@
 // limitations under the License.
 
 import {replaceTomlValue} from '../../util/toml-edit';
-import {DEP_KINDS, parseCargoManifest} from './common';
+import {DEP_KINDS, isInheritedVersion, parseCargoManifest} from './common';
 import {logger as defaultLogger, Logger} from '../../util/logger';
 import {DefaultUpdater} from '../default';
 
 /**
  * Updates `Cargo.toml` manifests, preserving formatting and comments.
+ *
+ * Handles three kinds of manifests:
+ * - a package with a literal `[package].version` (bumped in place);
+ * - a package inheriting `[package].version.workspace = true` from the
+ *   workspace root (its own version is left untouched);
+ * - a workspace root with `[workspace.package].version` (the single source
+ *   of truth for shared-version workspaces).
  */
 export class CargoToml extends DefaultUpdater {
   /**
@@ -34,16 +41,43 @@ export class CargoToml extends DefaultUpdater {
     }
 
     const parsed = parseCargoManifest(payload);
-    if (!parsed.package) {
+    const packageVersion = parsed.package?.version;
+
+    if (isInheritedVersion(packageVersion)) {
+      // version.workspace = true: the member's version is synchronized with
+      // [workspace.package].version in the root manifest, so it is updated
+      // there and must not be rewritten here.
+      logger.info('skipping [package].version (inherited from workspace root)');
+    } else if (parsed.package !== undefined) {
+      if (packageVersion === undefined) {
+        const msg = '[package] is missing [version]';
+        logger.error(msg);
+        throw new Error(msg);
+      }
+      if (typeof packageVersion !== 'string') {
+        const msg = 'invalid [package.version] (expected a version string)';
+        logger.error(msg);
+        throw new Error(msg);
+      }
+      payload = replaceTomlValue(
+        payload,
+        ['package', 'version'],
+        this.version.toString()
+      );
+    }
+
+    // Workspace roots carry the shared version in [workspace.package].
+    if (parsed.workspace?.package?.version !== undefined) {
+      payload = replaceTomlValue(
+        payload,
+        ['workspace', 'package', 'version'],
+        this.version.toString()
+      );
+    } else if (parsed.package === undefined) {
       const msg = 'is not a package manifest (might be a cargo workspace)';
       logger.error(msg);
       throw new Error(msg);
     }
-    payload = replaceTomlValue(
-      payload,
-      ['package', 'version'],
-      this.version.toString()
-    );
 
     for (const [pkgName, pkgVersion] of this.versionsMap) {
       for (const depKind of DEP_KINDS) {

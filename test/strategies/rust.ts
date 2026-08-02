@@ -14,10 +14,17 @@
 
 import {describe, it, afterEach, beforeEach} from 'mocha';
 import {expect} from 'chai';
+import {readFileSync} from 'fs';
+import {resolve} from 'path';
 import {GitHub} from '../../src/github';
 import {Rust} from '../../src/strategies/rust';
 import * as sinon from 'sinon';
-import {buildGitHubFileContent, assertHasUpdate, dateSafe} from '../helpers';
+import {
+  buildGitHubFileContent,
+  assertHasUpdate,
+  assertNoHasUpdate,
+  dateSafe,
+} from '../helpers';
 import {buildMockConventionalCommit} from '../helpers';
 import {TagName} from '../../src/util/tag-name';
 import {Version} from '../../src/version';
@@ -214,6 +221,60 @@ describe('Rust Workspace', () => {
       const updates = release!.updates;
       assertHasUpdate(updates, 'crates/crate1/Cargo.toml', CargoToml);
       assertHasUpdate(updates, 'crates/crate2/Cargo.toml', CargoToml);
+      assertHasUpdate(updates, 'Cargo.toml', CargoToml);
+      assertHasUpdate(updates, 'Cargo.lock', CargoLock);
+    });
+
+    it('bumps the root version for inherited-version members only', async () => {
+      const strategy = new Rust({
+        targetBranch: 'main',
+        github,
+        component: 'google-cloud-automl',
+      });
+      sandbox
+        .stub(github, 'getFileContentsOnBranch')
+        .withArgs('Cargo.toml', 'main')
+        .resolves(
+          buildGitHubFileContent(fixturesPath, 'Cargo-workspace-shared.toml')
+        )
+        .withArgs('crates/crate1/Cargo.toml', 'main')
+        .resolves(
+          buildGitHubFileContent(fixturesPath, 'Cargo-crate1-inherited.toml')
+        )
+        .withArgs('crates/crate2/Cargo.toml', 'main')
+        .resolves(
+          buildGitHubFileContent(fixturesPath, 'Cargo-crate2-inherited.toml')
+        );
+      const latestRelease = {
+        tag: new TagName(Version.parse('0.1.0'), 'google-cloud-automl'),
+        sha: 'abc123',
+        notes: 'some notes',
+      };
+      const release = await strategy.buildReleasePullRequest(
+        COMMITS,
+        latestRelease
+      );
+      const updates = release!.updates;
+      // crate1 has no path-dependencies: its manifest must not be touched.
+      assertNoHasUpdate(updates, 'crates/crate1/Cargo.toml');
+      // crate2 carries a versioned path-dependency on crate1: it is updated
+      // (dependency only, its own version stays inherited).
+      const crate2Update = assertHasUpdate(
+        updates,
+        'crates/crate2/Cargo.toml',
+        CargoToml
+      );
+      const crate2Content = (crate2Update.updater as CargoToml).updateContent(
+        readFileSync(
+          resolve(fixturesPath, 'Cargo-crate2-inherited.toml'),
+          'utf8'
+        )
+      );
+      expect(crate2Content).to.contain('version = { workspace = true }');
+      expect(crate2Content).to.contain(
+        'crate1 = { version = "0.1.1", path = "../crate1" }'
+      );
+      // The root manifest is updated (single source of truth).
       assertHasUpdate(updates, 'Cargo.toml', CargoToml);
       assertHasUpdate(updates, 'Cargo.lock', CargoLock);
     });

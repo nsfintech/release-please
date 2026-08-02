@@ -51,7 +51,7 @@ export function buildMockPackageUpdate(
     createIfMissing: false,
     cachedFileContents,
     updater: new CargoToml({
-      version: Version.parse(manifest.package?.version || 'FIXME'),
+      version: Version.parse(String(manifest.package?.version || 'FIXME')),
     }),
   };
 }
@@ -604,6 +604,107 @@ describe('CargoWorkspace plugin', () => {
         err => {
           return (
             err instanceof ConfigurationError && err.message.includes('invalid')
+          );
+        }
+      );
+    });
+    it('bumps the root version for workspace-inherited members', async () => {
+      const candidates: CandidateReleasePullRequest[] = [
+        buildMockCandidatePullRequest('packages/rustA', 'rust', '1.1.2', {
+          component: '@here/pkgA',
+        }),
+      ];
+      stubFilesFromFixtures({
+        sandbox,
+        github,
+        fixturePath: fixturesPath,
+        files: [],
+        flatten: false,
+        targetBranch: 'main',
+        inlineFiles: [
+          [
+            'Cargo.toml',
+            '[workspace]\nmembers = ["packages/rustA"]\n\n[workspace.package]\nversion = "1.1.1"',
+          ],
+          [
+            'packages/rustA/Cargo.toml',
+            '[package]\nname = "pkgA"\nversion = { workspace = true }\n\n[dependencies]\ntracing = "1.0.0"',
+          ],
+        ],
+      });
+      sandbox
+        .stub(github, 'findFilesByGlobAndRef')
+        .withArgs('packages/rustA', 'main')
+        .resolves(['packages/rustA']);
+      plugin = new CargoWorkspace(github, 'main', {
+        'packages/rustA': {
+          releaseType: 'rust',
+        },
+      });
+      const newCandidates = await plugin.run(candidates);
+      expect(newCandidates).lengthOf(1);
+      const rustCandidate = newCandidates.find(
+        candidate => candidate.config.releaseType === 'rust'
+      );
+      expect(rustCandidate).to.not.be.undefined;
+      const updates = rustCandidate!.pullRequest.updates;
+      // The member manifest is not rewritten (its version is inherited).
+      assertNoHasUpdate(updates, 'packages/rustA/Cargo.toml');
+      // The root manifest bumps [workspace.package].version.
+      const rootUpdate = assertHasUpdate(updates, 'Cargo.toml', CargoToml);
+      const rootContent = (rootUpdate.updater as CargoToml).updateContent(
+        '[workspace]\nmembers = ["packages/rustA"]\n\n[workspace.package]\nversion = "1.1.1"\n'
+      );
+      expect(rootContent).to.contain('version = "1.1.2"');
+      assertHasUpdate(updates, 'Cargo.lock');
+    });
+    it('throws a clear error when inherited version has no root version', async () => {
+      const candidates: CandidateReleasePullRequest[] = [
+        buildMockCandidatePullRequest('packages/rustA', 'rust', '1.1.2', {
+          component: '@here/pkgA',
+        }),
+      ];
+      stubFilesFromFixtures({
+        sandbox,
+        github,
+        fixturePath: fixturesPath,
+        files: [],
+        flatten: false,
+        targetBranch: 'main',
+        inlineFiles: [
+          [
+            'Cargo.toml',
+            '[workspace]\nmembers = ["packages/rustA", "packages/rustB"]',
+          ],
+          [
+            'packages/rustA/Cargo.toml',
+            '[package]\nname = "pkgA"\nversion = { workspace = true }',
+          ],
+        ],
+      });
+      sandbox
+        .stub(github, 'findFilesByGlobAndRef')
+        .withArgs('packages/rustA', 'main')
+        .resolves(['packages/rustA'])
+        .withArgs('packages/rustB', 'main')
+        .resolves(['packages/rustB']);
+      plugin = new CargoWorkspace(github, 'main', {
+        'packages/rustA': {
+          releaseType: 'rust',
+        },
+        'packages/rustB': {
+          releaseType: 'rust',
+        },
+      });
+      await assert.rejects(
+        async () => {
+          await plugin.run(candidates);
+        },
+        err => {
+          return (
+            err instanceof ConfigurationError &&
+            err.message.includes('workspace root') &&
+            err.message.includes('[workspace.package].version')
           );
         }
       );

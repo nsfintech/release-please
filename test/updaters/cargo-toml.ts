@@ -53,6 +53,40 @@ describe('CargoToml', () => {
       }).to.throw();
     });
 
+    it('updates [workspace.package].version in a workspace root', async () => {
+      const oldContent = `[workspace]
+members = ["crates/crate1", "crates/crate2"]
+
+[workspace.package]
+version = "0.1.0"
+`;
+      const newVersion = Version.parse('0.2.0');
+      const versions = new Map();
+      const cargoToml = new CargoToml({
+        version: newVersion,
+        versionsMap: versions,
+      });
+      const newContent = cargoToml.updateContent(oldContent);
+      expect(newContent).to.contain('version = "0.2.0"');
+      expect(newContent).to.contain('[workspace.package]');
+    });
+
+    it('leaves an inherited member version untouched', async () => {
+      const oldContent = `[package]
+name = "crate1"
+version = { workspace = true }
+`;
+      const newVersion = Version.parse('0.2.0');
+      const versions = new Map();
+      const cargoToml = new CargoToml({
+        version: newVersion,
+        versionsMap: versions,
+      });
+      const newContent = cargoToml.updateContent(oldContent);
+      expect(newContent).to.contain('version = { workspace = true }');
+      expect(newContent).not.to.contain('version = "0.2.0"');
+    });
+
     it('updates the crate version while preserving formatting', async () => {
       const oldContent = readFileSync(
         resolve(fixturesPath, './Cargo.toml'),

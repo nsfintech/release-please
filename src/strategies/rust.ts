@@ -19,10 +19,16 @@ import {Changelog} from '../updaters/changelog';
 // Cargo.toml support
 import {CargoToml} from '../updaters/rust/cargo-toml';
 import {CargoLock} from '../updaters/rust/cargo-lock';
-import {CargoManifest, parseCargoManifest} from '../updaters/rust/common';
+import {
+  CargoManifest,
+  hasVersionedWorkspacePathDeps,
+  isInheritedVersion,
+  parseCargoManifest,
+} from '../updaters/rust/common';
 import {BaseStrategy, BuildUpdatesOptions} from './base';
 import {VersionsMap, Version} from '../version';
 import {Update} from '../update';
+import {ConfigurationError} from '../errors';
 
 export class Rust extends BaseStrategy {
   private packageManifest?: CargoManifest | null;
@@ -49,6 +55,8 @@ export class Rust extends BaseStrategy {
 
     if (workspaceManifest?.workspace?.members) {
       const members = workspaceManifest.workspace.members;
+      const rootVersion = workspaceManifest.workspace.package?.version;
+
       if (workspaceManifest.package?.name) {
         versionsMap.set(workspaceManifest.package.name, version);
       } else {
@@ -61,6 +69,8 @@ export class Rust extends BaseStrategy {
 
       // Collect submodule names to update
       const manifestsByPath: Map<string, GitHubFileContents> = new Map();
+      const memberManifests: Map<string, CargoManifest> = new Map();
+      const workspaceCrateNames = new Set<string>();
       for (const member of members) {
         const manifestPath = `${member}/Cargo.toml`;
         const manifestContent = await this.getContent(manifestPath);
@@ -72,27 +82,63 @@ export class Rust extends BaseStrategy {
         }
         const manifest = parseCargoManifest(manifestContent.parsedContent);
         manifestsByPath.set(manifestPath, manifestContent);
+        memberManifests.set(manifestPath, manifest);
+        if (isInheritedVersion(manifest.package?.version)) {
+          if (rootVersion === undefined) {
+            throw new ConfigurationError(
+              `member ${member} inherits its version from the workspace root, but ` +
+                'the root Cargo.toml has no [workspace.package].version',
+              'rust',
+              `${this.github.repository.owner}/${this.github.repository.repo}`
+            );
+          }
+        }
         if (!manifest.package?.name) {
           this.logger.warn(`member ${member} has no package name`);
           continue;
         }
+        workspaceCrateNames.add(manifest.package.name);
         versionsMap.set(manifest.package.name, version);
       }
       this.logger.info(`updating ${manifestsByPath.size} submodules`);
       this.logger.debug('versions map:', versionsMap);
 
       for (const [manifestPath, manifestContent] of manifestsByPath) {
-        updates.push({
-          path: this.addPath(manifestPath),
-          createIfMissing: false,
-          cachedFileContents: manifestContent,
-          updater: new CargoToml({
-            version,
-            versionsMap,
-          }),
-        });
+        const manifest = memberManifests.get(manifestPath)!;
+        const inherited = isInheritedVersion(manifest.package?.version);
+        if (inherited) {
+          // version.workspace = true members are versioned by the root
+          // [workspace.package].version, so only their path-dependencies need
+          // to be updated in-place.
+          if (hasVersionedWorkspacePathDeps(manifest, workspaceCrateNames)) {
+            updates.push({
+              path: this.addPath(manifestPath),
+              createIfMissing: false,
+              cachedFileContents: manifestContent,
+              updater: new CargoToml({
+                version,
+                versionsMap,
+              }),
+            });
+          } else {
+            this.logger.info(
+              `skipping ${manifestPath} (version inherited from workspace root)`
+            );
+          }
+        } else {
+          updates.push({
+            path: this.addPath(manifestPath),
+            createIfMissing: false,
+            cachedFileContents: manifestContent,
+            updater: new CargoToml({
+              version,
+              versionsMap,
+            }),
+          });
+        }
       }
-      // Update root Cargo.toml
+      // Update root Cargo.toml. For shared-version workspaces this is where
+      // [workspace.package].version gets bumped.
       updates.push({
         path: this.addPath('Cargo.toml'),
         createIfMissing: false,
