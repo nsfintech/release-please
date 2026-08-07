@@ -506,7 +506,13 @@ export class Manifest {
     const latestVersion = await latestReleaseVersion(
       github,
       targetBranch,
-      version => isPublishedVersion(strategy, version),
+      // nsfintech fork: stable 模式(prerelease=false)跳过 prerelease 版本作为 baseline,
+      // 这样 test 的 rc tag 合并进 main 后,main 仍以最近 stable release 为基线,自动
+      // graduation(rc.N -> X.Y.Z)。prerelease 模式(test)照常接受 rc 作基线递增。
+      // 对 main-only 调用方无影响(无 rc tag,filter 不生效)。
+      version =>
+        isPublishedVersion(strategy, version) &&
+        (config.prerelease || !version.preRelease),
       config,
       component,
       manifestOptions?.logger
@@ -1697,7 +1703,11 @@ async function latestReleaseVersion(
         );
         continue;
       }
-      candidateReleaseVersions.push(tagName.version);
+      // nsfintech fork: 同样应用 releaseFilter(stable 模式跳过 prerelease),
+      // 否则 rc release 会被收进 candidate,sort 后返回 rc 而非最近 stable。
+      if (releaseFilter(tagName.version)) {
+        candidateReleaseVersions.push(tagName.version);
+      }
     }
   }
   logger.debug(
@@ -1727,7 +1737,10 @@ async function latestReleaseVersion(
         );
         continue;
       }
-      candidateTagVersion.push(tagName.version);
+      // nsfintech fork: 同样应用 releaseFilter(stable 模式跳过 prerelease)。
+      if (releaseFilter(tagName.version)) {
+        candidateTagVersion.push(tagName.version);
+      }
     }
   }
   logger.debug(
