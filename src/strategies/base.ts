@@ -23,6 +23,7 @@ import {
   ExtraFile,
 } from '../manifest';
 import {DefaultVersioningStrategy} from '../versioning-strategies/default';
+import {PrereleaseVersioningStrategy} from '../versioning-strategies/prerelease';
 import {DefaultChangelogNotes} from '../changelog-notes/default';
 import {Update} from '../update';
 import {ConventionalCommit, Commit} from '../commit';
@@ -570,7 +571,25 @@ export abstract class BaseStrategy implements Strategy {
       );
     }
 
-    return this.initialReleaseVersion();
+    // 首版(无 tag 历史)也过 versioningStrategy:prerelease 模式下给初始版本
+    // 挂上预发布后缀(如 0.1.0 -> 0.1.0-rc),否则首版 rc 通道会发出裸 stable
+    // 版本号(nsffintech fork:fix bootstrap prerelease)。不走 bump()(会把
+    // 0.1.0 bump 成 0.1.1-rc);只在 PrereleaseVersioningStrategy 且未带后缀时挂后缀。
+    const initial = this.initialReleaseVersion();
+    if (
+      !initial.preRelease &&
+      this.versioningStrategy instanceof PrereleaseVersioningStrategy &&
+      this.versioningStrategy.prerelease === true
+    ) {
+      return new Version(
+        initial.major,
+        initial.minor,
+        initial.patch,
+        this.versioningStrategy.prereleaseType,
+        initial.build
+      );
+    }
+    return initial;
   }
 
   protected async buildVersionsMap(
